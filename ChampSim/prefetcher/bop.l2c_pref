@@ -1,0 +1,223 @@
+#include "cache.h"
+
+
+
+
+
+
+
+void CACHE::l2c_prefetcher_initialize() { cout << "CPU " << cpu << " L2C best offset prefetcher" << endl; }
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in) {
+    if (type != LOAD )
+        return metadata_in;
+
+
+    // IF CACHE HIT AND PREFETCH MISS, RETURN WITHOUT PREFETCHING
+    // WE WILL CONSIDER ONLY THOSE ACCESSES TO L2 CACHE WHICH ARE EITHER MISS OR PREFETCH HIT
+    if(cache_hit){
+
+        uint32_t set = get_set(addr);
+        uint32_t way = get_way(addr, set);
+        if (block[set][way].address == addr){
+            uint8_t pref_bit = block[set][way].prefetch_bit;
+
+            if(!pref_bit){
+                return metadata_in;
+            } else{
+                // UPDATING THE PREFETCH BIT IN CACHE
+                block[set][way].prefetch_bit = 0;
+            }
+        }
+        
+
+    }
+
+
+    // UPDATING GAUGE AND RATE FOR MANAGING MSHR
+    if(!cache_hit){
+        // update gauge and rate for X
+        gauge += current_core_cycle[0] - last_access - rate; 
+
+        if(gauge >= GAUGE_UP){
+            rate++;
+        } else if(gauge <= GAUGE_DOWN){
+            rate--;
+        }
+
+        last_access = current_core_cycle[0];
+    }
+
+
+
+    // X_dash = X + O
+    uint64_t pf_addr = ((addr >> LOG2_BLOCK_SIZE) + current_offset) << LOG2_BLOCK_SIZE;
+
+
+    // SENDING PREFETCH REQUEST ONLY IF PREFETCH ON (WE HAVE THE ABILITY TO STALL PREFETCHER IF IT PERFORMS BADLY)
+    if(pref_on){
+
+        if(MSHR.occupancy <= threshold){
+            prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+        }
+
+       
+        gauge += current_core_cycle[0] - last_access - rate; 
+
+        if(gauge >= GAUGE_UP){
+            rate++;
+        } else if(gauge <= GAUGE_DOWN){
+            rate--;
+        }
+
+        last_access = current_core_cycle[0];
+
+    }
+
+
+    DP(if (warmup_complete[cpu]) {
+        cout << "[" << NAME << "] " << __func__ << hex << " base_cl: " << (addr >> LOG2_BLOCK_SIZE);
+        cout << " pf_cl: " << (pf_addr >> LOG2_BLOCK_SIZE) << " ip: " << ip << " cache_hit: " << +cache_hit
+             << " type: " << +type << endl;
+    });
+
+
+    //Far future Near future
+    // optimize bw time and accuracy
+    // tradeoff
+    // Why two banks in RR table
+
+
+    // Update queue
+    uint64_t x = addr; 
+    if ((queue_index + 1) % (QUEUE_LEN + 1) == queue_remove_index) {
+        
+        queue_remove_index++;
+        if (queue_remove_index >= QUEUE_LEN+1) queue_remove_index = 0;
+    }
+    // QUEUE IS A QUEUE OF TUPLES, X AND EXPIRY DATE
+    delayQueue2[queue_index][0] = x;
+    delayQueue2[queue_index][1] = current_core_cycle[0] + 60;
+    queue_index++;
+    if(queue_index >= QUEUE_LEN+1) queue_index = 0;
+
+    
+
+
+    // UPDATE rr_left BY REMOVING ALL EXPIRED VALUE FROM THE DELAY QUEUE
+    int gap = current_core_cycle[0] - last_cycle;
+    int i=0;
+    for(i=0; i<QUEUE_LEN+1; i++){
+        if(delayQueue2[(queue_remove_index+i)%(QUEUE_LEN+1)][1] < current_core_cycle[0]){
+            rr_left[rr_left_index] = delayQueue2[(queue_remove_index+i)%(QUEUE_LEN+1)][0];
+            rr_left_index = (rr_left_index+1)%RR_LEN; 
+
+        } else{
+            break;
+        }
+    }
+
+    queue_remove_index = (queue_remove_index+i)%(QUEUE_LEN+1);
+
+
+
+
+    // LEARNING PART
+
+    // o_dash is the offset whose score is to be updated
+    int o_dash = offset_list[offset_index][0];
+    uint64_t x_dash = ((addr >> LOG2_BLOCK_SIZE) - o_dash) << LOG2_BLOCK_SIZE;
+
+    // FINDING x_dash IN rr_left
+    for(int i=0; i<RR_LEN; i++){
+        if(rr_left[i] == x_dash || rr_right[i] == x_dash){
+            offset_list[offset_index][1]++;
+            break;
+        }
+    }
+
+    offset_index++;
+    
+    // NEW ROUND
+    if(offset_index == OFFSET_LEN){
+        round_counter++;
+
+        // RESET OFFSET_INDEX (n)
+        offset_index = 0;
+
+        
+        // FINDING MAX_SCORE AND BEST_INDEX CORRESPONDING TO IT.
+        int max_score = 0;
+        int best_index=0;
+        for(int i=0; i<OFFSET_LEN; i++){
+            if (offset_list[i][1] >= max_score){
+                max_score = offset_list[i][1];
+                best_index = i;
+            }
+        }
+
+
+        // CHECKING IF LEARNING PHASE FINISHES HERE OR NOT
+        if(max_score >= SCORE_MAX || round_counter >= ROUND_MAX){
+
+            // NEW LEARNING PHASE STARTS
+
+            // reset scores
+            for(int i=0; i<OFFSET_LEN; i++){
+                offset_list[i][1] = 0;
+            }
+    
+            // update current offset
+            pref_on = true;
+            if(max_score <= BAD_SCORE){
+                pref_on = false;
+            }
+            current_offset = offset_list[best_index][0];
+
+            // reset round_counter
+            round_counter = 0;
+
+            // UPDATING THRESHOLD FOR MSHR AS MENTIONED IN THE PAPER
+            if(max_score >= LOW_SCORE || rate > 2*BW){
+                threshold = 12;
+            } else if(rate < BW){
+                threshold = 2;
+            } else{
+                threshold = 2 + 10*((float)rate-BW)/BW;
+            }
+
+        }
+    }
+
+
+
+
+    return metadata_in;
+
+    
+
+
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in) {
+
+    // IF THIS IS CAME FROM A PREFETCH REQUEST
+    if(prefetch){
+
+        // update rr_right
+        uint64_t y_dash = ((addr >> LOG2_BLOCK_SIZE) - current_offset) << LOG2_BLOCK_SIZE;
+        rr_right[rr_right_index] = y_dash;
+        rr_right_index++;
+        if (rr_right_index >= RR_LEN) rr_right_index = 0;
+
+        block[set][way].prefetch_bit = 1;
+    } else{
+        block[set][way].prefetch_bit = 0;
+    }
+
+
+         
+    return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats() { cout << "CPU " << cpu << " L2C next line prefetcher final stats" << endl; }
